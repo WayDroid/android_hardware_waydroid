@@ -37,13 +37,25 @@ int SoftGateKeeperDevice::enroll(uint32_t uid,
         current_password_length = 0;
     }
 
-    SizedBuffer desired_password_buffer(const_cast<uint8_t *>(desired_password), desired_password_length);
-    SizedBuffer current_password_handle_buffer(const_cast<uint8_t *>(current_password_handle), current_password_handle_length);
+    uint8_t * desired_password_buf = new uint8_t[desired_password_length];
+    memcpy(desired_password_buf, desired_password, desired_password_length);
+    SizedBuffer desired_password_buffer(desired_password_buf, desired_password_length);
 
-    SizedBuffer current_password_buffer(const_cast<uint8_t *>(current_password), current_password_length);
+    uint8_t * current_password_handle_buf = nullptr;
+    if (current_password_handle_length != 0) {
+        current_password_handle_buf = new uint8_t[current_password_handle_length];
+        memcpy(current_password_handle_buf, current_password_handle, current_password_handle_length);
+    }
+    SizedBuffer current_password_handle_buffer(current_password_handle_buf, current_password_handle_length);
 
-    EnrollRequest request(uid, move(current_password_handle_buffer), move(desired_password_buffer),
-            move(current_password_buffer));
+    uint8_t * current_password_buf = nullptr;
+    if (current_password_length != 0) {
+        current_password_buf = new uint8_t[current_password_length];
+        memcpy(current_password_buf, current_password, current_password_length);
+    }
+    SizedBuffer current_password_buffer(current_password_buf, current_password_length);
+
+    EnrollRequest request(uid, move(current_password_handle_buffer), move(desired_password_buffer), move(current_password_buffer));
     EnrollResponse response;
 
     impl_->Enroll(request, &response);
@@ -75,8 +87,19 @@ int SoftGateKeeperDevice::verify(uint32_t uid,
         return -EINVAL;
     }
 
-    SizedBuffer password_handle_buffer(const_cast<uint8_t *>(enrolled_password_handle), enrolled_password_handle_length);
-    SizedBuffer provided_password_buffer(const_cast<uint8_t *>(provided_password), provided_password_length);
+    uint8_t * enrolled_password_handle_buf = nullptr;
+    if (enrolled_password_handle_length != 0) {
+        enrolled_password_handle_buf = new uint8_t[enrolled_password_handle_length];
+        memcpy(enrolled_password_handle_buf, enrolled_password_handle, enrolled_password_handle_length);
+    }
+    SizedBuffer password_handle_buffer(enrolled_password_handle_buf, enrolled_password_handle_length);
+
+    uint8_t * provided_password_buf = nullptr;
+    if (provided_password_length != 0) {
+        provided_password_buf = new uint8_t[provided_password_length];
+        memcpy(provided_password_buf, provided_password, provided_password_length);
+    }
+    SizedBuffer provided_password_buffer(provided_password_buf, provided_password_length);
 
     VerifyRequest request(uid, challenge, move(password_handle_buffer), move(provided_password_buffer));
     VerifyResponse response;
