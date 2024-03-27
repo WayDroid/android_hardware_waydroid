@@ -800,6 +800,55 @@ static const struct wl_keyboard_listener keyboard_listener = {
     keyboard_handle_repeat_info,
 };
 
+static void pointer_handle_button_to_touch_down(struct display *display) {
+    struct input_event event[6];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    display->isTouchDown = true;
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
+static void pointer_handle_button_to_touch_up(struct display *display) {
+    struct input_event event[3];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    display->isTouchDown = false;
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
 static void
 pointer_handle_enter(void *data, struct wl_pointer *pointer,
                      uint32_t serial, struct wl_surface *surface,
@@ -851,17 +900,23 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     x += display->layers[display->pointer_surface].x;
     y += display->layers[display->pointer_surface].y;
 
-    ADD_EVENT(EV_ABS, ABS_X, x);
-    ADD_EVENT(EV_ABS, ABS_Y, y);
-    ADD_EVENT(EV_REL, REL_X, x - display->ptrPrvX);
-    ADD_EVENT(EV_REL, REL_Y, y - display->ptrPrvY);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-    display->ptrPrvX = x;
-    display->ptrPrvY = y;
+    if (display->isTouchDown) {
+        display->ptrPrvX = x;
+        display->ptrPrvY = y;
+        pointer_handle_button_to_touch_down(display);
+    } else {
+        ADD_EVENT(EV_ABS, ABS_X, x);
+        ADD_EVENT(EV_ABS, ABS_Y, y);
+        ADD_EVENT(EV_REL, REL_X, x - display->ptrPrvX);
+        ADD_EVENT(EV_REL, REL_Y, y - display->ptrPrvY);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        display->ptrPrvX = x;
+        display->ptrPrvY = y;
 
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+        if (res < sizeof(event))
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+    }
 }
 
 void
@@ -908,27 +963,42 @@ pointer_handle_button(void *data, struct wl_pointer *,
                       uint32_t state)
 {
     struct display* display = (struct display*)data;
-    struct input_event event[2];
-    struct timespec rt;
-    unsigned int res, n = 0;
+    // Left button convert to touch event, right button reserved mouse event
+    if(((button == BTN_LEFT && property_get_bool("fde.click_as_touch", false)) || display->isTouchDown) && !display->isMouseLeftDown) {
+        // convert pointer event to touch event
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            pointer_handle_button_to_touch_down(display);
+        } else {
+            pointer_handle_button_to_touch_up(display);
+        }
+    }else{
+        struct input_event event[2];
+        struct timespec rt;
+        unsigned int res, n = 0;
 
-    if (ensure_pipe(display, INPUT_POINTER))
-        return;
+        if (ensure_pipe(display, INPUT_POINTER))
+            return;
 
-    if (!display->pointer_surface)
-        return;
+        if (!display->pointer_surface)
+            return;
 
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                   __FILE__, __LINE__, strerror(errno));
+        }
+        if(button == BTN_LEFT){
+            if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+                display->isMouseLeftDown = true;
+            } else {
+                display->isMouseLeftDown = false;
+            }
+        }
+        ADD_EVENT(EV_KEY, button, state);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
     }
-    ADD_EVENT(EV_KEY, button, state);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
 }
+
 
 static void
 pointer_handle_axis(void *data, struct wl_pointer *,
@@ -1258,10 +1328,15 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         d->input_fd[INPUT_POINTER] = -1;
         d->ptrPrvX = 0;
         d->ptrPrvY = 0;
+        d->isTouchDown = false;
         d->reverseScroll = property_get_bool("persist.waydroid.reverse_scrolling", false);
         mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
         chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        // for emulate touch input event
+        d->input_fd[INPUT_TOUCH] = -1;
+        mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRWXO | S_IRWXG | S_IRWXU);
+        chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
         remove(INPUT_PIPE_NAME[INPUT_POINTER]);
         wl_pointer_destroy(d->pointer);
