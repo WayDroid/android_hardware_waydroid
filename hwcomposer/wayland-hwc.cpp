@@ -1869,6 +1869,12 @@ static const struct wl_registry_listener registry_listener = {
     registry_handle_global_remove
 };
 
+static int
+str_starts_with(const char *a, const char *b)
+{
+    return strncmp(a, b, strlen(b));
+}
+
 int
 get_gralloc_type(const char *gralloc)
 {
@@ -1876,7 +1882,7 @@ get_gralloc_type(const char *gralloc)
         return GRALLOC_DEFAULT;
     } else if (strcmp(gralloc, "gbm") == 0) {
         return GRALLOC_GBM;
-    } else if (strcmp(gralloc, "minigbm_gbm_mesa") == 0) {
+    } else if (str_starts_with(gralloc, "minigbm_") == 0) {
         return GRALLOC_CROS;
     } else {
         return GRALLOC_ANDROID;
