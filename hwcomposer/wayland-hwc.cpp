@@ -964,7 +964,7 @@ pointer_handle_axis(void *data, struct wl_pointer *,
             return;
         move = (int)(display->wheelAccumulatorX / step);
         display->wheelAccumulatorX = display->wheelEvtIsDiscrete ? 0 :
-                                     std::fmod(display->wheelAccumulatorY, step);
+                                     std::fmod(display->wheelAccumulatorX, step);
     }
 
     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
