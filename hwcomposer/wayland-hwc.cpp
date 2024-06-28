@@ -984,14 +984,15 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     }
 }
 
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+	.relative_motion = handle_relative_motion,
+};
+
 void
 handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
         uint32_t, uint32_t, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t, wl_fixed_t)
 {
     struct display *display = (struct display *)data;
-    struct input_event event[3];
-    struct timespec rt;
-    unsigned int res, n = 0;
 
     static double acc_x = 0;
     static double acc_y = 0;
@@ -1005,21 +1006,25 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
     if (abs(acc_x) < 1 && abs(acc_y) < 1)
         return;
 
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
+    if(!display->isTouchDown && pointer_cancel_axis_to_touch(display, false, false)){
+        struct input_event event[3];
+        struct timespec rt;
+        unsigned int res, n = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                  __FILE__, __LINE__, strerror(errno));
+        }
+        ADD_EVENT(EV_REL, REL_X, (int)acc_x);
+        ADD_EVENT(EV_REL, REL_Y, (int)acc_y);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+        acc_x -= (int)acc_x;
+        acc_y -= (int)acc_y;
+
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+        if (res < sizeof(event))
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
     }
-
-    ADD_EVENT(EV_REL, REL_X, (int)acc_x);
-    ADD_EVENT(EV_REL, REL_Y, (int)acc_y);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-
-    acc_x -= (int)acc_x;
-    acc_y -= (int)acc_y;
-
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
 }
 
 static void
@@ -1463,6 +1468,9 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
         chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        d->relative_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+				d->relative_pointer_manager, d->pointer);
+        zwp_relative_pointer_v1_add_listener(d->relative_pointer, &relative_pointer_listener,d);
         // for emulate touch input event
         d->input_fd[INPUT_TOUCH] = -1;
         mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRWXO | S_IRWXG | S_IRWXU);
