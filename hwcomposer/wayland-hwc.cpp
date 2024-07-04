@@ -878,6 +878,7 @@ pointer_handle_leave(void *data, struct wl_pointer *pointer,
 static bool
 pointer_cancel_axis_to_touch(struct display *display, bool fromAxisStopEvent, bool force)
 {
+    display->wheelEvtIsDiscrete = false;
     // Check if the scroll wheel event has started.
     if (display->lastAxisEventNanoSeconds == 0) {
         return true;
@@ -1191,8 +1192,10 @@ pointer_handle_axis_stop(void *data, struct wl_pointer *, uint32_t, uint32_t)
 }
 
 static void
-pointer_handle_axis_discrete(void *, struct wl_pointer *, uint32_t, int32_t)
+pointer_handle_axis_discrete(void *data, struct wl_pointer *, uint32_t, int32_t)
 {
+    struct display* display = (struct display*)data;
+    display->wheelEvtIsDiscrete = true;
 }
 
 static void
