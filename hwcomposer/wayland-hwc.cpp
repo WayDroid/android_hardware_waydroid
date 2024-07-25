@@ -1073,7 +1073,7 @@ pointer_handle_button(void *data, struct wl_pointer *,
 }
 
 static void
-pointer_axis_to_touch(struct display *display, int move)
+pointer_axis_to_touch(struct display *display, int move, bool verticalScroll)
 {
     struct input_event event[6];
     struct timespec rt;
@@ -1088,7 +1088,11 @@ pointer_axis_to_touch(struct display *display, int move)
     }
 
     int64_t nanoSeconds = rt.tv_sec * 1000 * 1000 * 1000 + rt.tv_nsec;
-    display->axisY += move;
+    if(verticalScroll){
+        display->axisY += move;
+    }else{
+        display->axisX += move;
+    }
 
     // if ((nanoSeconds - display->lastAxisEventNanoSeconds) < 20 * 1000 * 1000) {
     //     return;
@@ -1096,10 +1100,16 @@ pointer_axis_to_touch(struct display *display, int move)
 
     if (display->lastAxisEventNanoSeconds == 0) {
         display->axisY = display->ptrPrvY;
+        display->axisX = display->ptrPrvX;
         ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID);
         ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, AXIS_TOUCH_TRACKING_ID);
-        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
-        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+        if(verticalScroll){
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+        }else{
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->axisX);
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+        }
         ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
         ADD_EVENT(EV_SYN, SYN_REPORT, 0);
         res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
@@ -1115,8 +1125,13 @@ pointer_axis_to_touch(struct display *display, int move)
     display->lastAxisEventNanoSeconds = nanoSeconds;
     ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID);
     ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, AXIS_TOUCH_TRACKING_ID);
-    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
-    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+    if(verticalScroll){
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+    }else{
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->axisX);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+    }
     ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
     res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
@@ -1167,7 +1182,7 @@ pointer_handle_axis(void *data, struct wl_pointer *,
     }
 
     if(property_get_bool("fde.click_as_touch", false)){
-        pointer_axis_to_touch(display, touchMove);
+        pointer_axis_to_touch(display, touchMove, axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
     }else{
         if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
             ALOGE("%s:%d error in touch clock_gettime: %s",
