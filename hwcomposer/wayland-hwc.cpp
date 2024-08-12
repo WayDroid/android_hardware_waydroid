@@ -81,6 +81,8 @@ const int AXIS_TOUCH_SLOT_ID = 8;
 const int AXIS_TOUCH_TRACKING_ID = AXIS_TOUCH_SLOT_ID;
 
 struct buffer;
+static void handle_pinch_update(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t time, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t scale, wl_fixed_t rotation);
+static void handle_pinch_end(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t serial, uint32_t time, int cancelled);
 
 void
 destroy_buffer(struct buffer* buf) {
@@ -780,6 +782,17 @@ keyboard_handle_key(void *data, struct wl_keyboard *,
 {
     if (key == KEY_POWER)
         return;
+    struct display* display = (struct display*)data;
+    if (key == KEY_LEFTCTRL || key == KEY_RIGHTCTRL){
+        display->ctrl_key_pressed = state;
+        if(!display->ctrl_key_pressed){
+            if(display->axis_simulation_two_finger_started){
+                handle_pinch_end(data, NULL, 0, 0, 0);
+                display->axis_simulation_two_finger_started = false;
+                display->gesture_scale = 300;
+            }
+        }
+    }
     send_key_event((struct display*)data, key, (enum wl_keyboard_key_state)state);
 }
 
@@ -941,6 +954,9 @@ pointer_handle_motion(void *data, struct wl_pointer *,
                       uint32_t, wl_fixed_t sx, wl_fixed_t sy)
 {
     struct display* display = (struct display*)data;
+    if(display->ctrl_key_pressed){
+        return;
+    }
     int x, y;
 
     if (ensure_pipe(display, INPUT_POINTER))
@@ -994,6 +1010,9 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
         uint32_t, uint32_t, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t, wl_fixed_t)
 {
     struct display *display = (struct display *)data;
+    if(display->ctrl_key_pressed){
+        return;
+    }
 
     static double acc_x = 0;
     static double acc_y = 0;
@@ -1182,7 +1201,23 @@ pointer_handle_axis(void *data, struct wl_pointer *,
     }
 
     if(property_get_bool("fde.click_as_touch", false)){
-        pointer_axis_to_touch(display, touchMove, axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
+        if(display->ctrl_key_pressed){
+            if(touchMove > 0){
+                display->gesture_scale += 15;
+            }else{
+                display->gesture_scale -= 15;
+                if(display->gesture_scale < 15){
+                    display->gesture_scale = 15;
+                }
+            }
+            if(display->lastAxisEventNanoSeconds != 0){
+                pointer_cancel_axis_to_touch(display, true, true);
+            }
+            handle_pinch_update(data, NULL,0,0,0,display->gesture_scale,0);
+            display->axis_simulation_two_finger_started = true;
+        }else{
+            pointer_axis_to_touch(display, touchMove, axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
+        }
     }else{
         if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
             ALOGE("%s:%d error in touch clock_gettime: %s",
@@ -2329,6 +2364,7 @@ create_display(const char *gralloc)
     display->task = IWaydroidTask::getService();
     display->isTouchDown = false;
     display->lastAxisEventNanoSeconds = 0;
+    display->gesture_scale = 300;
     return display;
 }
 

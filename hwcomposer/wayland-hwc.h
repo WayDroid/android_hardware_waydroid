@@ -139,6 +139,9 @@ struct display {
     int axisY;
     int axisX;
     int64_t lastAxisEventNanoSeconds;
+    bool ctrl_key_pressed;
+    wl_fixed_t gesture_scale;
+    bool axis_simulation_two_finger_started;
     int touch_id[MAX_TOUCHPOINTS];
     std::map<struct wl_surface *, struct layerFrame> layers;
     std::map<struct wl_surface *, struct window *> windows;
