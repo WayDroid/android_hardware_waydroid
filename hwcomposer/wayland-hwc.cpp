@@ -73,10 +73,16 @@
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include <pointer-gestures-unstable-v1-client-protocol.h>
 
 using ::android::hardware::hidl_string;
 
+const int AXIS_TOUCH_SLOT_ID = 8;
+const int AXIS_TOUCH_TRACKING_ID = AXIS_TOUCH_SLOT_ID;
+
 struct buffer;
+static void handle_pinch_update(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t time, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t scale, wl_fixed_t rotation);
+static void handle_pinch_end(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t serial, uint32_t time, int cancelled);
 
 void
 destroy_buffer(struct buffer* buf) {
@@ -238,7 +244,7 @@ create_dmabuf_wl_buffer(struct display *display, struct buffer *buffer,
     return 0;
 }
 
-static int 
+static int
 ConvertHalFormatToShm(uint32_t hal_format) {
     uint32_t fmt;
 
@@ -540,7 +546,7 @@ create_window(struct display *display, bool use_subsurfaces, std::string appID, 
         window->xdg_surface =
                 xdg_wm_base_get_xdg_surface(display->wm_base, window->surface);
         assert(window->xdg_surface);
-        
+
         xdg_surface_add_listener(window->xdg_surface,
                                      &xdg_surface_listener, window);
 
@@ -776,6 +782,17 @@ keyboard_handle_key(void *data, struct wl_keyboard *,
 {
     if (key == KEY_POWER)
         return;
+    struct display* display = (struct display*)data;
+    if (key == KEY_LEFTCTRL || key == KEY_RIGHTCTRL){
+        display->ctrl_key_pressed = state;
+        if(!display->ctrl_key_pressed){
+            if(display->axis_simulation_two_finger_started){
+                handle_pinch_end(data, NULL, 0, 0, 0);
+                display->axis_simulation_two_finger_started = false;
+                display->gesture_scale = 300;
+            }
+        }
+    }
     send_key_event((struct display*)data, key, (enum wl_keyboard_key_state)state);
 }
 
@@ -800,6 +817,55 @@ static const struct wl_keyboard_listener keyboard_listener = {
     keyboard_handle_repeat_info,
 };
 
+static void pointer_handle_button_to_touch_down(struct display *display) {
+    struct input_event event[6];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    display->isTouchDown = true;
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
+static void pointer_handle_button_to_touch_up(struct display *display) {
+    struct input_event event[3];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    display->isTouchDown = false;
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
 static void
 pointer_handle_enter(void *data, struct wl_pointer *pointer,
                      uint32_t serial, struct wl_surface *surface,
@@ -807,9 +873,13 @@ pointer_handle_enter(void *data, struct wl_pointer *pointer,
 {
     struct display *display = (struct display *)data;
     display->pointer_surface = surface;
-    if (display->cursor_surface)
+    if (display->cursor_surface){
+        display->serial = serial;
+        int32_t icon_hotspot_x = property_get_int32("fde.mouse_icon_hotspot_x", 5);
+        int32_t icon_hotspot_y = property_get_int32("fde.mouse_icon_hotspot_y", 5);
         wl_pointer_set_cursor(pointer, serial,
-                              display->cursor_surface, 0, 0);
+                              display->cursor_surface, icon_hotspot_x, icon_hotspot_y);
+    }
 }
 
 static void
@@ -818,30 +888,89 @@ pointer_handle_leave(void *data, struct wl_pointer *pointer,
 {
     struct display *display = (struct display *)data;
     display->pointer_surface = NULL;
-    if (display->cursor_surface)
+    display->mouse_icon_addr = -1;
+    if (display->cursor_surface){
         wl_pointer_set_cursor(pointer, serial, NULL, 0, 0);
+    }
 }
+
+
+
+static bool
+pointer_cancel_axis_to_touch(struct display *display, bool fromAxisStopEvent, bool force)
+{
+    display->wheelEvtIsDiscrete = false;
+    // Check if the scroll wheel event has started.
+    if (display->lastAxisEventNanoSeconds == 0) {
+        return true;
+    }
+
+    struct input_event event[12];
+    int eventSize = fromAxisStopEvent ? 3 * sizeof(input_event) : sizeof(event);
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return false;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    // Prevent minor mouse movements from interrupting the touch scrolling process while scrolling the wheel.
+    if (!force && ((rt.tv_sec * 1000 * 1000 * 1000 + rt.tv_nsec - display->lastAxisEventNanoSeconds) < 300 * 1000 * 1000)) {
+        return false;
+    }
+
+    display->axisY = display->ptrPrvY;
+    display->lastAxisEventNanoSeconds = 0;
+
+    if (!fromAxisStopEvent) {
+        // Use the second touch click to prevent inertial scrolling
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID + 1);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, AXIS_TOUCH_TRACKING_ID + 1);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX + 1);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+        ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+    if (!fromAxisStopEvent) {
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID + 1);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    }
+
+    res = write(display->input_fd[INPUT_TOUCH], &event, eventSize);
+    if (res < sizeof(event)) {
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
 
 static void
 pointer_handle_motion(void *data, struct wl_pointer *,
                       uint32_t, wl_fixed_t sx, wl_fixed_t sy)
 {
     struct display* display = (struct display*)data;
-    struct input_event event[5];
-    struct timespec rt;
+    if(display->ctrl_key_pressed){
+        return;
+    }
     int x, y;
-    unsigned int res, n = 0;
 
     if (ensure_pipe(display, INPUT_POINTER))
         return;
 
     if (!display->pointer_surface)
         return;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
-    }
     x = wl_fixed_to_int(sx);
     y = wl_fixed_to_int(sy);
     if (display->scale != 1) {
@@ -851,27 +980,49 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     x += display->layers[display->pointer_surface].x;
     y += display->layers[display->pointer_surface].y;
 
-    ADD_EVENT(EV_ABS, ABS_X, x);
-    ADD_EVENT(EV_ABS, ABS_Y, y);
-    ADD_EVENT(EV_REL, REL_X, x - display->ptrPrvX);
-    ADD_EVENT(EV_REL, REL_Y, y - display->ptrPrvY);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-    display->ptrPrvX = x;
-    display->ptrPrvY = y;
+    if (display->isTouchDown) {
+        display->ptrPrvX = x;
+        display->ptrPrvY = y;
+        pointer_handle_button_to_touch_down(display);
+    } else if (pointer_cancel_axis_to_touch(display, false, false)) {
+        struct input_event event[5];
+        struct timespec rt;
+        unsigned int res, n = 0;
 
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                __FILE__, __LINE__, strerror(errno));
+        }
+
+        ADD_EVENT(EV_ABS, ABS_X, x);
+        ADD_EVENT(EV_ABS, ABS_Y, y);
+        ADD_EVENT(EV_REL, REL_X, x - display->ptrPrvX);
+        ADD_EVENT(EV_REL, REL_Y, y - display->ptrPrvY);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        display->ptrPrvX = x;
+        display->ptrPrvY = y;
+        if(property_get_bool("fde.inject_as_touch", false)){
+            return;
+        }
+
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+        if (res < sizeof(event))
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+    }
 }
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+	.relative_motion = handle_relative_motion,
+};
 
 void
 handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
         uint32_t, uint32_t, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t, wl_fixed_t)
 {
     struct display *display = (struct display *)data;
-    struct input_event event[3];
-    struct timespec rt;
-    unsigned int res, n = 0;
+    if(display->ctrl_key_pressed){
+        return;
+    }
 
     static double acc_x = 0;
     static double acc_y = 0;
@@ -885,21 +1036,28 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
     if (abs(acc_x) < 1 && abs(acc_y) < 1)
         return;
 
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
+    if(!display->isTouchDown && pointer_cancel_axis_to_touch(display, false, false)){
+        struct input_event event[3];
+        struct timespec rt;
+        unsigned int res, n = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                  __FILE__, __LINE__, strerror(errno));
+        }
+        ADD_EVENT(EV_REL, REL_X, (int)acc_x);
+        ADD_EVENT(EV_REL, REL_Y, (int)acc_y);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+        acc_x -= (int)acc_x;
+        acc_y -= (int)acc_y;
+
+        if(property_get_bool("fde.inject_as_touch", false)){
+            return;
+        }
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+        if (res < sizeof(event))
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
     }
-
-    ADD_EVENT(EV_REL, REL_X, (int)acc_x);
-    ADD_EVENT(EV_REL, REL_Y, (int)acc_y);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-
-    acc_x -= (int)acc_x;
-    acc_y -= (int)acc_y;
-
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
 }
 
 static void
@@ -908,24 +1066,107 @@ pointer_handle_button(void *data, struct wl_pointer *,
                       uint32_t state)
 {
     struct display* display = (struct display*)data;
-    struct input_event event[2];
+    pointer_cancel_axis_to_touch(display, false, true);
+
+    // Left button convert to touch event, right button reserved mouse event
+    if(((button == BTN_LEFT && property_get_bool("fde.click_as_touch", false)) || display->isTouchDown) && !display->isMouseLeftDown) {
+        // convert pointer event to touch event
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            pointer_handle_button_to_touch_down(display);
+        } else {
+            pointer_handle_button_to_touch_up(display);
+        }
+    }else{
+        struct input_event event[2];
+        struct timespec rt;
+        unsigned int res, n = 0;
+
+        if (ensure_pipe(display, INPUT_POINTER))
+            return;
+
+        if (!display->pointer_surface)
+            return;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                   __FILE__, __LINE__, strerror(errno));
+        }
+        if(button == BTN_LEFT){
+            if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+                display->isMouseLeftDown = true;
+            } else {
+                display->isMouseLeftDown = false;
+            }
+        }
+        ADD_EVENT(EV_KEY, button, state);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+    }
+}
+
+static void
+pointer_axis_to_touch(struct display *display, int move, bool verticalScroll)
+{
+    struct input_event event[6];
     struct timespec rt;
     unsigned int res, n = 0;
 
-    if (ensure_pipe(display, INPUT_POINTER))
-        return;
-
-    if (!display->pointer_surface)
+    if (ensure_pipe(display, INPUT_TOUCH))
         return;
 
     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
         ALOGE("%s:%d error in touch clock_gettime: %s",
               __FILE__, __LINE__, strerror(errno));
     }
-    ADD_EVENT(EV_KEY, button, state);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
 
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+    int64_t nanoSeconds = rt.tv_sec * 1000 * 1000 * 1000 + rt.tv_nsec;
+    if(verticalScroll){
+        display->axisY += move;
+    }else{
+        display->axisX += move;
+    }
+
+    // if ((nanoSeconds - display->lastAxisEventNanoSeconds) < 20 * 1000 * 1000) {
+    //     return;
+    // }
+
+    if (display->lastAxisEventNanoSeconds == 0) {
+        display->axisY = display->ptrPrvY;
+        display->axisX = display->ptrPrvX;
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, AXIS_TOUCH_TRACKING_ID);
+        if(verticalScroll){
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+        }else{
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->axisX);
+            ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+        }
+        ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+        if (res < sizeof(event)) {
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+            return;
+        }
+
+        n = 0;
+        display->axisY += move;
+    }
+
+    display->lastAxisEventNanoSeconds = nanoSeconds;
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, AXIS_TOUCH_SLOT_ID);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, AXIS_TOUCH_TRACKING_ID);
+    if(verticalScroll){
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->ptrPrvX);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->axisY);
+    }else{
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->axisX);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->ptrPrvY);
+    }
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
     if (res < sizeof(event))
         ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
 }
@@ -935,9 +1176,14 @@ pointer_handle_axis(void *data, struct wl_pointer *,
                     uint32_t, uint32_t axis, wl_fixed_t value)
 {
     struct display* display = (struct display*)data;
+    int touchMove = display->reverseScroll ? wl_fixed_to_int(value) : -wl_fixed_to_int(value);
+    if (display->wheelEvtIsDiscrete) {
+        touchMove *= 6;
+    }
+
     struct input_event event[2];
     struct timespec rt;
-    unsigned int res, move, n = 0;
+    unsigned int move, res, n = 0;
     double fVal = wl_fixed_to_double(value) / 10.0f;
     double step = 1.0f;
 
@@ -964,21 +1210,40 @@ pointer_handle_axis(void *data, struct wl_pointer *,
             return;
         move = (int)(display->wheelAccumulatorX / step);
         display->wheelAccumulatorX = display->wheelEvtIsDiscrete ? 0 :
-                                     std::fmod(display->wheelAccumulatorY, step);
+                                     std::fmod(display->wheelAccumulatorX, step);
     }
 
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
-    }
-
-    ADD_EVENT(EV_REL, (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    if(property_get_bool("fde.click_as_touch", false)){
+        if(display->ctrl_key_pressed){
+            if(touchMove > 0){
+                display->gesture_scale += 15;
+            }else{
+                display->gesture_scale -= 15;
+                if(display->gesture_scale < 15){
+                    display->gesture_scale = 15;
+                }
+            }
+            if(display->lastAxisEventNanoSeconds != 0){
+                pointer_cancel_axis_to_touch(display, true, true);
+            }
+            handle_pinch_update(data, NULL,0,0,0,display->gesture_scale,0);
+            display->axis_simulation_two_finger_started = true;
+        }else{
+            pointer_axis_to_touch(display, touchMove, axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
+        }
+    }else{
+        if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+            ALOGE("%s:%d error in touch clock_gettime: %s",
+                  __FILE__, __LINE__, strerror(errno));
+        }
+        ADD_EVENT(EV_REL, (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
               ? REL_WHEEL : REL_HWHEEL, move);
-    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
 
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
-        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+        res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
+        if (res < sizeof(event))
+            ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+    }
 }
 
 static void
@@ -989,13 +1254,17 @@ pointer_handle_axis_source(void *data, struct wl_pointer *, uint32_t source)
 }
 
 static void
-pointer_handle_axis_stop(void *, struct wl_pointer *, uint32_t, uint32_t)
+pointer_handle_axis_stop(void *data, struct wl_pointer *, uint32_t, uint32_t)
 {
+    struct display* display = (struct display*)data;
+    pointer_cancel_axis_to_touch(display, true, true);
 }
 
 static void
-pointer_handle_axis_discrete(void *, struct wl_pointer *, uint32_t, int32_t)
+pointer_handle_axis_discrete(void *data, struct wl_pointer *, uint32_t, int32_t)
 {
+    struct display* display = (struct display*)data;
+    display->wheelEvtIsDiscrete = true;
 }
 
 static void
@@ -1247,6 +1516,174 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     xdg_wm_base_ping,
 };
 
+static void handle_swipe_begin(void *data, struct zwp_pointer_gesture_swipe_v1 *gesture, uint32_t serial, uint32_t time, struct wl_surface *surface, uint32_t fingers)
+{
+    (void) data;
+    (void) gesture;
+    (void) serial;
+    (void) time;
+    (void) surface;
+    (void) fingers;
+    ALOGI("handle_swipe_begin");
+}
+
+static void handle_swipe_update(void *data, struct zwp_pointer_gesture_swipe_v1 *gesture, uint32_t time, wl_fixed_t dx, wl_fixed_t dy)
+{
+    (void) data;
+    (void) gesture;
+    (void) time;
+    (void) dx;
+    (void) dy;
+    ALOGI("handle_swipe_update");
+}
+
+static void handle_swipe_end(void *data, struct zwp_pointer_gesture_swipe_v1 *gesture, uint32_t serial, uint32_t time, int cancelled)
+{
+    (void) data;
+    (void) gesture;
+    (void) serial;
+    (void) time;
+    (void) cancelled;
+    ALOGI("handle_swipe_end");
+}
+
+static void handle_pinch_begin(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t serial, uint32_t time, struct wl_surface *surface, uint32_t fingers)
+{
+    (void) data;
+    (void) gesture;
+    (void) serial;
+    (void) time;
+    (void) surface;
+    (void) fingers;
+    ALOGI("handle_pinch_begin");
+}
+
+static void handle_pinch_update(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t time, wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t scale, wl_fixed_t rotation)
+{
+    (void) data;
+    (void) gesture;
+    (void) time;
+    (void) dx;
+    (void) dy;
+    (void) scale;
+    (void) rotation;
+    struct display* display = (struct display*)data;
+    struct input_event event[12];
+    struct timespec rt;
+    int x, y;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+       ALOGE("%s:%d error in touch clock_gettime: %s",
+            __FILE__, __LINE__, strerror(errno));
+    }
+    x = wl_fixed_to_int(dx) + display->ptrPrvX;
+    y = wl_fixed_to_int(dy) + display->ptrPrvY;
+
+
+    double iscale = wl_fixed_to_double(scale);
+    double irotation = 90;
+
+    int x0 = x - (100.0 * iscale * cos(irotation));
+    int y0 = y - (100.0 * iscale * sin(irotation));
+    int x1 = x + (100.0 * iscale * cos(irotation));
+    int y1 = y + (100.0 * iscale * sin(irotation));
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, x0);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, y0);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 1);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, 1);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, x1);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, y1);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+
+}
+
+static void handle_pinch_end(void *data, struct zwp_pointer_gesture_pinch_v1 *gesture, uint32_t serial, uint32_t time, int cancelled)
+{
+    ALOGI("handle_pinch_end");
+    (void) data;
+    (void) gesture;
+    (void) serial;
+    (void) time;
+    (void) cancelled;
+    struct display* display = (struct display*)data;
+    struct input_event event[6];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+       ALOGE("%s:%d error in touch clock_gettime: %s",
+            __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, 1);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
+static const struct zwp_pointer_gesture_swipe_v1_listener swipe_listener = {
+    handle_swipe_begin,
+    handle_swipe_update,
+    handle_swipe_end
+};
+
+static const struct zwp_pointer_gesture_pinch_v1_listener pinch_listener = {
+    handle_pinch_begin,
+    handle_pinch_update,
+    handle_pinch_end
+};
+
+static void wl_pointer_gesture_add_listener(struct display *display) {
+    if(!display->pointer_gestures)return;
+    display->pointer_gestures_swipe = zwp_pointer_gestures_v1_get_swipe_gesture(display->pointer_gestures, display->pointer);
+    display->pointer_gestures_pinch = zwp_pointer_gestures_v1_get_pinch_gesture(display->pointer_gestures, display->pointer);
+    zwp_pointer_gesture_swipe_v1_add_listener(display->pointer_gestures_swipe, &swipe_listener, display);
+    zwp_pointer_gesture_pinch_v1_add_listener(display->pointer_gestures_pinch, &pinch_listener, display);
+}
+
+static void
+release_pointer_gestures_device(struct display *display)
+{
+    if (display->pointer_gestures_swipe) {
+        zwp_pointer_gesture_swipe_v1_destroy(display->pointer_gestures_swipe);
+        display->pointer_gestures_swipe = NULL;
+    }
+
+    if (display->pointer_gestures_pinch) {
+        zwp_pointer_gesture_pinch_v1_destroy(display->pointer_gestures_pinch);
+        display->pointer_gestures_pinch = NULL;
+    }
+
+    if (display->pointer_gestures){
+        zwp_pointer_gestures_v1_destroy(display->pointer_gestures);
+        display->pointer_gestures = NULL;
+    }
+}
+
+
 static void
 seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
 {
@@ -1258,10 +1695,19 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         d->input_fd[INPUT_POINTER] = -1;
         d->ptrPrvX = 0;
         d->ptrPrvY = 0;
+        d->isTouchDown = false;
         d->reverseScroll = property_get_bool("persist.waydroid.reverse_scrolling", false);
         mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
         chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        wl_pointer_gesture_add_listener(d);
+        d->relative_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+				d->relative_pointer_manager, d->pointer);
+        zwp_relative_pointer_v1_add_listener(d->relative_pointer, &relative_pointer_listener,d);
+        // for emulate touch input event
+        d->input_fd[INPUT_TOUCH] = -1;
+        mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRWXO | S_IRWXG | S_IRWXU);
+        chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
         remove(INPUT_PIPE_NAME[INPUT_POINTER]);
         wl_pointer_destroy(d->pointer);
@@ -1832,8 +2278,8 @@ registry_handle_global(void *data, struct wl_registry *registry,
                (strcmp(interface, "android_wlegl") == 0)) {
         d->android_wlegl = (struct android_wlegl*)wl_registry_bind(registry, id,
                 &android_wlegl_interface, 1);
-    } else if ((d->gtype == GRALLOC_GBM || d->gtype == GRALLOC_CROS) &&
-               (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)) {
+    } else if ((d->gtype == GRALLOC_GBM || d->gtype == GRALLOC_CROS || d->gtype == GRALLOC_X100  ||
+        d->gtype == GRALLOC_RANCHU)  &&  (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)) {
         if (version < 3)
             return;
         d->dmabuf = (struct zwp_linux_dmabuf_v1*)wl_registry_bind(registry, id,
@@ -1856,7 +2302,10 @@ registry_handle_global(void *data, struct wl_registry *registry,
     } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         d->fractional_scale_manager = (struct wp_fractional_scale_manager_v1*)wl_registry_bind(registry, id,
                 &wp_fractional_scale_manager_v1_interface, 1);
-    }
+    }else if (strcmp(interface, "zwp_pointer_gestures_v1") == 0) {
+        d->pointer_gestures = (struct zwp_pointer_gestures_v1 *)wl_registry_bind(
+                registry, id, &zwp_pointer_gestures_v1_interface, 1);
+     }
 }
 
 static void
@@ -1882,8 +2331,12 @@ get_gralloc_type(const char *gralloc)
         return GRALLOC_DEFAULT;
     } else if (strcmp(gralloc, "gbm") == 0) {
         return GRALLOC_GBM;
+    } else if (strcmp(gralloc, "ranchu") == 0) {
+    return GRALLOC_RANCHU;
     } else if (str_starts_with(gralloc, "minigbm_") == 0) {
         return GRALLOC_CROS;
+    } else if (strcmp(gralloc, "ft2004") == 0) {
+        return GRALLOC_X100;
     } else {
         return GRALLOC_ANDROID;
     }
@@ -1926,6 +2379,9 @@ create_display(const char *gralloc)
     wl_display_roundtrip(display->display);
 
     display->task = IWaydroidTask::getService();
+    display->isTouchDown = false;
+    display->lastAxisEventNanoSeconds = 0;
+    display->gesture_scale = 300;
     return display;
 }
 
@@ -1955,8 +2411,11 @@ destroy_display(struct display *display)
     if (display->pointer_constraints)
         zwp_pointer_constraints_v1_destroy(display->pointer_constraints);
 
+    release_pointer_gestures_device(display);
+
     wl_registry_destroy(display->registry);
     wl_display_flush(display->display);
     wl_display_disconnect(display->display);
     delete display;
 }
+

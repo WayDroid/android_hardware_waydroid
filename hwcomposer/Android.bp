@@ -54,11 +54,15 @@ cc_library_shared {
     header_libs: [
         "libsystem_headers",
         "minigbm_headers",
+//        "libgralloc_cb.ranchu",
     ],
     include_dirs: [
         "system/core",
         "system/core/libsync",
-        "system/core/libsync/include"
+        "system/core/libsync/include",
+        "device/generic/goldfish-opengl/shared/gralloc_cb/include",
+        "device/generic/goldfish-opengl/shared/qemupipe/include",
+        "device/generic/goldfish-opengl/shared/qemupipe/include-types",
     ],
     cflags: [
         "-DLOG_TAG=\"hwcomposer\"",

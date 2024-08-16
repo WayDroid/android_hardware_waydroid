@@ -40,6 +40,7 @@
 #include <audio_utils/echo_reference.h>
 #include <hardware/audio_effect.h>
 #include <audio_effects/effect_aec.h>
+#include "pa_volume_ctl.h"
 
 /* Minimum granularity - Arbitrary but small value */
 #define CODEC_BASE_FRAME_COUNT 32
@@ -881,25 +882,23 @@ static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
 {
     ALOGV("adev_set_master_volume: %f", volume);
-    return -ENOSYS;
+    return pa_set_master_volume(volume);
 }
 
 static int adev_get_master_volume(struct audio_hw_device *dev, float *volume)
 {
-    ALOGV("adev_get_master_volume: %f", *volume);
-    return -ENOSYS;
+    return pa_get_master_volume(volume);
 }
 
 static int adev_set_master_mute(struct audio_hw_device *dev, bool muted)
 {
     ALOGV("adev_set_master_mute: %d", muted);
-    return -ENOSYS;
+    return pa_set_master_mute(muted);
 }
 
 static int adev_get_master_mute(struct audio_hw_device *dev, bool *muted)
 {
-    ALOGV("adev_get_master_mute: %d", *muted);
-    return -ENOSYS;
+    return pa_get_master_mute(muted);
 }
 
 static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)

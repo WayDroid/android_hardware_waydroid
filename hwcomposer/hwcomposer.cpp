@@ -41,6 +41,8 @@
 #include <gralloc_handle.h>
 #include <cros_gralloc/cros_gralloc_handle.h>
 
+#include <gralloc_cb_bp.h>
+
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 #include <cutils/trace.h>
 #include <utils/Trace.h>
@@ -83,6 +85,76 @@ struct waydroid_hwc_composer_device_1 {
     bool multi_windows;
 };
 
+static struct buffer *get_wl_buffer(struct waydroid_hwc_composer_device_1 *pdev, hwc_layer_1_t *layer, size_t pos);
+static void setup_viewport_destination(wp_viewport *viewport, hwc_rect_t frame, struct display *display);
+
+static void erase_cursor_layer_buffer(waydroid_hwc_composer_device_1* pdev, buffer_handle_t handle){
+    auto it = pdev->display->buffer_map.find(handle);
+    if (it != pdev->display->buffer_map.end()) {
+        destroy_buffer(it->second);
+        pdev->display->buffer_map.erase(it);
+    }
+}
+
+static bool update_cursor_surface(waydroid_hwc_composer_device_1* pdev, hwc_layer_1_t* fb_layer, size_t layer) {
+    if (!pdev->display->cursor_surface) {
+        return false;
+    }
+
+    std::string layer_name = pdev->display->layer_names[layer];
+
+    if (layer_name.substr(0, 6) != "Sprite" || fb_layer->compositionType == HWC_FRAMEBUFFER_TARGET) {
+        return false;
+    }
+
+    fb_layer->compositionType = HWC_OVERLAY; // Not participating in SurfaceFlinger GPU compositing hide internal cursor
+
+    /*
+     * To update the wayland cursor, the fde.mouse_icon_addr system property was introduced.
+     * When the internal mouse shape changes, its value will change accordingly.
+     * Its value is set by SpriteController and PointerController.
+     */
+    int64_t mouse_icon_addr = property_get_int64("fde.mouse_icon_addr", 0);
+    if (pdev->display->mouse_icon_addr != mouse_icon_addr) {
+        pdev->display->mouse_icon_addr = mouse_icon_addr;
+        pdev->display->additional_refresh_cursor_times = 0;
+        erase_cursor_layer_buffer(pdev, fb_layer->handle);
+    }else{
+        if(pdev->display->additional_refresh_cursor_times > 3){      //Refresh the wayland cursor three additional times
+            return true;
+        }else{
+            erase_cursor_layer_buffer(pdev, fb_layer->handle);
+        }
+    }
+
+    struct buffer *buf = get_wl_buffer(pdev, fb_layer, layer);
+    if (!buf) {
+        ALOGE("Failed to get wayland buffer");
+        return true;
+    }
+
+    wl_surface_attach(pdev->display->cursor_surface, buf->buffer, 0, 0);
+    if (wl_surface_get_version(pdev->display->cursor_surface) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
+        wl_surface_damage_buffer(pdev->display->cursor_surface, 0, 0, buf->width, buf->height);
+    else
+        wl_surface_damage(pdev->display->cursor_surface, 0, 0, buf->width, buf->height);
+    if (!pdev->display->viewporter && pdev->display->scale > 1) {
+        // With no viewporter the scale is guaranteed to be integer
+        wl_surface_set_buffer_scale(pdev->display->cursor_surface, (int)pdev->display->scale);
+    } else if (pdev->display->viewporter && pdev->display->scale != 1) {
+        setup_viewport_destination(pdev->display->cursor_viewport, fb_layer->displayFrame, pdev->display);
+    }
+
+    wl_surface_commit(pdev->display->cursor_surface);
+    int32_t icon_hotspot_x = property_get_int32("fde.mouse_icon_hotspot_x", 5);
+    int32_t icon_hotspot_y = property_get_int32("fde.mouse_icon_hotspot_y", 5);
+    wl_pointer_set_cursor(pdev->display->pointer, pdev->display->serial,
+                                  pdev->display->cursor_surface, icon_hotspot_x, icon_hotspot_y);
+    pdev->display->additional_refresh_cursor_times++;
+
+    return true;
+}
+
 static int hwc_prepare(hwc_composer_device_1_t* dev,
                        size_t numDisplays, hwc_display_contents_1_t** displays) {
     struct waydroid_hwc_composer_device_1 *pdev = (struct waydroid_hwc_composer_device_1 *)dev;
@@ -98,7 +170,9 @@ static int hwc_prepare(hwc_composer_device_1_t* dev,
 
     std::pair<int, int> skipped(-1, -1);
     for (size_t i = 0; i < contents->numHwLayers; i++) {
-      if (!(contents->hwLayers[i].flags & HWC_SKIP_LAYER))
+      hwc_layer_1_t* fb_layer = &contents->hwLayers[i];
+
+      if (!(fb_layer->flags & HWC_SKIP_LAYER))
         continue;
 
       if (skipped.first == -1)
@@ -106,10 +180,13 @@ static int hwc_prepare(hwc_composer_device_1_t* dev,
       skipped.second = i;
     }
 
+    bool foundCursorLayer = false;
     for (size_t i = 0; i < contents->numHwLayers; i++) {
-        if (contents->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
+        hwc_layer_1_t* fb_layer = &contents->hwLayers[i];
+
+        if (fb_layer->compositionType == HWC_FRAMEBUFFER_TARGET)
             continue;
-        if (contents->hwLayers[i].flags & HWC_SKIP_LAYER)
+        if (fb_layer->flags & HWC_SKIP_LAYER)
             continue;
 
         /* skipped layers have to be composited by SurfaceFlinger; so in order
@@ -119,12 +196,18 @@ static int hwc_prepare(hwc_composer_device_1_t* dev,
            being composited, so we won't render skipped layers correctly in that mode */
         if (!pdev->multi_windows)
             if (skipped.first >= 0 && i > skipped.first && i < skipped.second)
-                contents->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
+                fb_layer->compositionType = HWC_FRAMEBUFFER;
 
-        if (contents->hwLayers[i].compositionType ==
+        if (fb_layer->compositionType ==
             (pdev->use_subsurface ? HWC_FRAMEBUFFER : HWC_OVERLAY))
-            contents->hwLayers[i].compositionType =
+            fb_layer->compositionType =
                 (pdev->use_subsurface ? HWC_OVERLAY : HWC_FRAMEBUFFER);
+        foundCursorLayer |= update_cursor_surface(pdev, fb_layer, i);
+    }
+    if(!foundCursorLayer && pdev->display->mouse_icon_addr != -1){
+        wl_pointer_set_cursor(pdev->display->pointer, pdev->display->serial, NULL, 0, 0);
+        pdev->display->mouse_icon_addr = -1;
+        ALOGI("wayland cursor hidden");
     }
 
     return 0;
@@ -212,6 +295,14 @@ static struct buffer *get_wl_buffer(struct waydroid_hwc_composer_device_1 *pdev,
             ret = create_shm_wl_buffer(pdev->display, buf, drm_handle->width, drm_handle->height, drm_handle->format, pixel_stride, layer->handle);
             update_shm_buffer(pdev->display, buf);
         }
+    } else if (pdev->display->gtype == GRALLOC_RANCHU) {
+        struct cb_handle_t* cb_handle = (struct cb_handle_t*)layer->handle;
+        auto width = cb_handle->width;
+        auto height = cb_handle->height;
+        auto hal_format = cb_handle->format;
+        ret = create_shm_wl_buffer(pdev->display, buf, width, height, hal_format,
+                                  pixel_stride, layer->handle);
+        update_shm_buffer(pdev->display, buf);
     } else if (pdev->display->gtype == GRALLOC_CROS) {
         const struct cros_gralloc_handle *cros_handle = (const struct cros_gralloc_handle *)layer->handle;
         if (pdev->display->dmabuf) {
@@ -220,6 +311,21 @@ static struct buffer *get_wl_buffer(struct waydroid_hwc_composer_device_1 *pdev,
             ret = create_shm_wl_buffer(pdev->display, buf, cros_handle->width, cros_handle->height, cros_handle->droid_format, pixel_stride, layer->handle);
             update_shm_buffer(pdev->display, buf);
         }
+    } else if (pdev->display->gtype == GRALLOC_X100) {
+        const X100_native_handle_t *cros_handle = (const X100_native_handle_t *)layer->handle;
+        if (pdev->display->dmabuf) {
+		//stride = pixel_stride * 4 is based on aligned memory by page(32bit)
+            ret = create_dmabuf_wl_buffer(pdev->display, buf, cros_handle->iWidth, cros_handle->iHeight, cros_handle->iFormat, -1, cros_handle->fd[0], pixel_stride, pixel_stride *4, 0,DRM_FORMAT_MOD_INVALID, layer->handle);
+		if (ret != 0 ){
+		    ALOGE("x100 create dmabuf wl buffer failed");
+		}
+        } else {
+		ret = create_shm_wl_buffer(pdev->display, buf, cros_handle->iWidth, cros_handle->iHeight, cros_handle->iFormat, pixel_stride, layer->handle);
+		if (ret != 0 ){
+		    ALOGE("x100 create shm wl buffer failed");
+		}
+		update_shm_buffer(pdev->display, buf);
+	}
     } else {
         if (pdev->display->gtype == GRALLOC_ANDROID) {
             ret = create_android_wl_buffer(pdev->display, buf, width, height, format, pixel_stride, layer->handle);
@@ -444,15 +550,15 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
 
 
     /*
-     * In prop "persist.waydroid.multi_windows" we detect HWC let SF rander layers 
+     * In prop "persist.waydroid.multi_windows" we detect HWC let SF rander layers
      * And just show the target client layer (single windows mode) or
      * render each layers in wayland surface and subsurfaces.
      * In prop "waydroid.active_apps" we choose what to be shown in window
      * and here if HWC is in single mode we show the screen only if any task are in screen
      * and in multi windows mode we group layers with same task ID in a wayland window.
      * And in prop "waydroid.blacklist_apps" we select apps to not show in display.
-     * 
-     * "waydroid.active_apps" prop can be: 
+     *
+     * "waydroid.active_apps" prop can be:
      * "none": No windows
      * "Waydroid": Shows android screen in a single window
      * "AppID": Shows apps in related windows as explained above
@@ -512,7 +618,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
             if (layer_name.substr(0, 4) == "TID:") {
                 std::string layer_tid = layer_name.substr(4, layer_name.find('#') - 4);
                 std::string layer_aid = layer_name.substr(layer_name.find('#') + 1, layer_name.find('/') - layer_name.find('#') - 1);
-                
+
                 std::istringstream iss(blacklist_apps);
                 std::string app;
                 while (std::getline(iss, app, ':')) {
@@ -648,7 +754,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
             continue;
         }
 
-        if (fb_layer->compositionType != 
+        if (fb_layer->compositionType !=
             (pdev->use_subsurface ? HWC_OVERLAY : HWC_FRAMEBUFFER_TARGET) && layer == l) {
             if (fb_layer->acquireFenceFd != -1) {
                 close(fb_layer->acquireFenceFd);
@@ -1171,6 +1277,7 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
         return -ENODEV;
     }
     ALOGE("wayland display %p", pdev->display);
+    pdev->display->mouse_icon_addr = -1;
 
     pthread_mutex_init(&pdev->vsync_lock, NULL);
     pdev->vsync_callback_enabled = true;
@@ -1190,7 +1297,7 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
     if (pdev->display->refresh > 1000 && pdev->display->refresh < 1000000)
         pdev->vsync_period_ns = 1000 * 1000 * 1000 / (pdev->display->refresh / 1000);
 
-    if (!property_get_bool("persist.waydroid.cursor_on_subsurface", false)) {
+    if (true/*!property_get_bool("persist.waydroid.cursor_on_subsurface", false)*/) {
         pdev->display->cursor_surface =
             wl_compositor_create_surface(pdev->display->compositor);
         if (pdev->display->viewporter) {
@@ -1198,7 +1305,6 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
                 wp_viewporter_get_viewport(pdev->display->viewporter, pdev->display->cursor_surface);
         }
     }
-
 
     struct timespec rt;
     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {

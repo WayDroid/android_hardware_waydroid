@@ -78,7 +78,9 @@ enum {
     GRALLOC_ANDROID,
     GRALLOC_GBM,
     GRALLOC_CROS,
-    GRALLOC_DEFAULT
+    GRALLOC_X100,
+    GRALLOC_DEFAULT,
+    GRALLOC_RANCHU,
 };
 
 #define MAX_TOUCHPOINTS 10
@@ -121,6 +123,9 @@ struct display {
     struct zwp_relative_pointer_v1 *relative_pointer;
     struct zwp_idle_inhibit_manager_v1 *idle_manager;
     struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
+    struct zwp_pointer_gestures_v1 *pointer_gestures;
+    struct zwp_pointer_gesture_swipe_v1 *pointer_gestures_swipe;
+    struct zwp_pointer_gesture_pinch_v1 *pointer_gestures_pinch;
     int gtype;
     double scale;
 
@@ -131,6 +136,11 @@ struct display {
     double wheelAccumulatorY;
     bool wheelEvtIsDiscrete;
     bool reverseScroll;
+    bool isTouchDown;
+    bool isMouseLeftDown;
+    int axisY;
+    int axisX;
+    int64_t lastAxisEventNanoSeconds;
     int touch_id[MAX_TOUCHPOINTS];
     std::map<struct wl_surface *, struct layerFrame> layers;
     std::map<struct wl_surface *, struct window *> windows;
@@ -165,6 +175,12 @@ struct display {
 
     bool isMaximized;
     sp<IWaydroidTask> task;
+    uint32_t serial;
+    int64_t mouse_icon_addr;
+    int additional_refresh_cursor_times;     //In order to get the final cursor shape
+    bool ctrl_key_pressed;
+    wl_fixed_t gesture_scale;
+    bool axis_simulation_two_finger_started;
 };
 
 struct buffer {
@@ -182,6 +198,29 @@ struct buffer {
     void *shm_data;
     int size;
 };
+
+typedef struct
+{
+	native_handle_t base;
+	int fd[3];
+	uint64_t ui64SUnknown;
+	int uUnknown;
+	int iWidth;
+	int iHeight;
+	int iFormat;
+	unsigned int uiBUnknown;
+	int iPUnknown;
+	int aiSUnknown[3];
+	int aiVSUnknown[3];
+	uint64_t aulUnknownO[3];
+	unsigned int auiMUnknownU[3];
+	unsigned int auiNumUnknownVCs[3];
+	unsigned int auiNumPUnknownPCs[3];
+	int iNumSUnknownAs;
+	int iLunKnown;
+
+} __attribute__((aligned(sizeof(int)),packed))  X100_native_handle_t;
+
 
 struct window {
     struct display *display;

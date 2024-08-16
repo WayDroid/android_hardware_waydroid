@@ -25,14 +25,20 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := audio.primary.waydroid
 LOCAL_PROPRIETARY_MODULE := true
 LOCAL_MODULE_RELATIVE_PATH := hw
-LOCAL_SRC_FILES := audio_hw.c
-LOCAL_SHARED_LIBRARIES := liblog libcutils libasound
+LOCAL_SRC_FILES := pa_volume_ctl.c audio_hw.c
+LOCAL_SHARED_LIBRARIES := liblog libcutils libasound libpulse
 LOCAL_HEADER_LIBRARIES := libhardware_headers
-LOCAL_CFLAGS := -Wno-unused-parameter
+LOCAL_CFLAGS := -Wno-unused-parameter \
+    -Wno-error \
+    -DPACKAGE \
+    -DPACKAGE_NAME=\"pulseaudio\" \
+    -DPACKAGE_VERSION=\"1.99\"
+
 LOCAL_C_INCLUDES += \
         external/alsa-lib/include \
         external/expat/lib \
         system/media/audio_utils/include \
-        system/media/audio_effects/include
+        system/media/audio_effects/include \
+        external/pulseaudio/src
 
 include $(BUILD_SHARED_LIBRARY)
